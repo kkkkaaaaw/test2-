@@ -3,7 +3,6 @@ import os
 import sys
 import locale
 from openai import OpenAI
-from openai._utils import convert_to_openai_object
 
 # ===================== 1. 彻底修复中文编码（关键！） =====================
 # 1.1 设置系统locale为UTF-8
