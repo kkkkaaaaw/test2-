@@ -1,86 +1,132 @@
-import time
 import os
 import sys
-import locale
+import datetime
+import time
+import requests
+import json
+import re
 from openai import OpenAI
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.header import Header
+from email.utils import formataddr
+import markdown
 
-# ===================== 1. 彻底修复中文编码（关键！） =====================
-# 1.1 设置系统locale为UTF-8
-try:
-    locale.setlocale(locale.LC_ALL, 'en_US.UTF-8')
-except:
-    locale.setlocale(locale.LC_ALL, 'C.UTF-8')
+# ==========================================
+# 1. 变量解析与环境加载
+# ==========================================
+raw_companies = os.getenv("TARGET_COMPANIES") or "山东未来机器人有限公司 威海广泰 威海国际经济技术合作股份有限公司 双丰物探 威尔海姆 迪尚集团"
+TARGET_COMPANIES = raw_companies.replace('、', ' ').replace('，', ' ') 
 
-# 1.2 强制Python全环节UTF-8
-os.environ.update({
-    'PYTHONIOENCODING': 'utf-8',
-    'LC_ALL': 'en_US.UTF-8',
-    'LANG': 'en_US.UTF-8',
-    'LC_CTYPE': 'en_US.UTF-8'
-})
-sys.stdout.reconfigure(encoding='utf-8')
-sys.stderr.reconfigure(encoding='utf-8')
+raw_industry = os.getenv("TARGET_INDUSTRY") or "工程承包 橡胶轮胎 医疗器械 油气装备 机器人"
+INDUSTRY_LIST = [i for i in raw_industry.replace('、', ' ').replace('，', ' ').split() if i]
 
-# ===================== 2. 基础配置（替换为你的实际值） =====================
-API_KEY = "你的Gemini/OpenAI API密钥"
-BASE_URL = "https://generativelanguage.googleapis.com/v1"  # Gemini的base_url
-model_name = "gemini-2.5-flash"
-GEMINI_REQUEST_DELAY = 2
-TODAY_STR = time.strftime("%Y年%m月%d日", time.localtime())
-CURRENT_YEAR = int(time.strftime("%Y", time.localtime()))
-TARGET_COMPANIES = "威高集团、三角轮胎、威海广泰、荣成华泰、文登威力工具"
+BOCHA_API_KEY = os.getenv("BOCHA_API_KEY")
+# 替换为 Bocha Web Search 的 Endpoint
+BOCHA_WEB_SEARCH_API_URL = "https://api.bocha.cn/v1/web-search"
 
-# ===================== 3. 初始化客户端（强制UTF-8请求头） =====================
-client = OpenAI(
-    api_key=API_KEY,
-    base_url=BASE_URL,
-    default_headers={
-        "Content-Type": "application/json; charset=utf-8",
-        "Accept": "application/json; charset=utf-8"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash") 
+GEMINI_REQUEST_DELAY = float(os.getenv("GEMINI_REQUEST_DELAY", "3.0"))
+
+EMAIL_SENDER = os.getenv("EMAIL_SENDER")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+EMAIL_RECEIVERS = os.getenv("EMAIL_RECEIVERS")
+SMTP_SERVER = "smtp.qq.com" 
+
+TODAY_STR = datetime.date.today().strftime("%Y年%m月%d日")
+CURRENT_YEAR = datetime.date.today().year
+GLOBAL_SEEN_URLS = set()
+
+# 拦截旧闻正则
+OUTDATED_YEAR_PATTERN = re.compile(r'(201\d|202[0-5])')
+
+# ==========================================
+# 2. Bocha Web Search 请求与解析函数
+# ==========================================
+def search_info(query, days=7, max_results=20, include_domains=None):
+    global GLOBAL_SEEN_URLS
+    
+    # 根据天数映射到 Bocha 支持的 freshness 枚举值
+    freshness = "oneWeek" if days <= 7 else "noLimit"
+    
+    # 根据官方文档，域名使用 | 分隔
+    include_str = "|".join(include_domains) if include_domains else ""
+
+    # Web Search 请求体
+    payload = {
+        "query": query,
+        "freshness": freshness,
+        "summary": True, # 开启文本摘要显示
+        "count": min(max_results, 50) # 最多50条
     }
-)
+    
+    if include_str:
+        payload["include"] = include_str
 
-# ===================== 4. 搜索函数（模拟/替换为真实逻辑） =====================
-def search_info(keywords):
-    """模拟搜索，返回非空UTF-8字符串"""
-    mock_data = {
-        f"{TARGET_COMPANIES} 威海 涉外业务 近7天": "威高集团获中东1亿美元医疗设备订单；三角轮胎海外工厂产能扩建30%；威海广泰拿下拉美机场设备订单；荣成华泰新能源汽车出口中亚；文登威力工具获欧盟专利认证",
-        "威海 荣成 文登 乳山 政经 外贸 招商 近7天": "威海发布2026外贸新政：中亚贸易通道补贴提升20%；荣成海洋经济产业园签约3个亿元项目；文登家纺产业对接中东经贸走廊；乳山海产品出口欧盟关税下调",
-        "威海 工程承包 橡胶轮胎 医疗器械 油气装备 机器人 行业动向 近7天": "医疗器械出口欧盟绿色壁垒升级：新增3项检测标准；轮胎行业原材料橡胶价格下跌5%；海洋工程装备出口东南亚增长15%",
-        "LPR 存款准备金率 美联储利率 汇率 威海银行 跨境结算 出口信贷 近7天": "2月LPR下调5个基点：1年期3.45%；美元兑人民币汇率中间价6.89；威海银行推出跨境结算手续费减免50%政策",
-        "国内国际政治经济 贸易局势 大宗商品价格 威海 近7天": "日韩自贸协定更新：威海汽配出口关税再降3%；中亚五国关税同盟利好威海农机出口；橡胶期货价格上涨3%；海产品国际价格波动+2%",
-        "大语言模型 AI 机器人 新能源 全球前沿科技 近7天": "大语言模型助力威海跨境电商AI翻译：效率提升40%；医疗AI在威高集团质检环节落地；深海装备AI检测技术突破；全球新能源电池技术迭代：成本降10%"
+    headers = {
+        "Authorization": f"Bearer {BOCHA_API_KEY}",
+        "Content-Type": "application/json",
     }
-    # 强制转为UTF-8编码字符串
-    result = mock_data.get(keywords, "默认素材内容，确保不为空")
-    return result.encode('utf-8').decode('utf-8')
 
-# ===================== 5. 生成周报函数（修复API调用编码） =====================
-def generate_briefing():
-    """生成周报，彻底解决中文编码问题"""
     try:
-        # 1. 搜索素材（确保UTF-8）
-        comp_raw = search_info(f"{TARGET_COMPANIES} 威海 涉外业务 近7天")
-        weihai_raw = search_info("威海 荣成 文登 乳山 政经 外贸 招商 近7天")
-        ind_context = search_info("威海 工程承包 橡胶轮胎 医疗器械 油气装备 机器人 行业动向 近7天")
-        finance_raw = search_info("LPR 存款准备金率 美联储利率 汇率 威海银行 跨境结算 出口信贷 近7天")
-        macro_raw = search_info("国内国际政治经济 贸易局势 大宗商品价格 威海 近7天")
-        tech_raw = search_info("大语言模型 AI 机器人 新能源 全球前沿科技 近7天")
+        response = requests.post(
+            url=BOCHA_WEB_SEARCH_API_URL, 
+            headers=headers, 
+            json=payload, 
+            timeout=15
+        )
+        response.raise_for_status()
+        
+        # 解析返回的网页参考资料
+        resp_json = response.json()
+        
+        # 兼容可能有或没有 'data' 包装层的返回格式
+        data_block = resp_json.get("data", resp_json)
+        webpages = data_block.get("webPages", {}).get("value", [])
+        
+        results_str = []
+        
+        for item in webpages:
+            # 组合 snippet 和 summary 作为内容，并截断防长文本
+            snippet = item.get("snippet", "")
+            summary = item.get("summary", "")
+            raw_content = f"{snippet} {summary}".replace('\n', ' ')
+            content = raw_content[:250] 
+            source_url = item.get("url", "无来源链接")
+            name = item.get("name", "无标题")
 
-        # 2. 构建prompt（强制UTF-8）
-        prompt_template = """
-【全局核心设定】
+            # 去重与旧闻拦截
+            if source_url in GLOBAL_SEEN_URLS and source_url != '无来源链接':
+                continue
+            if OUTDATED_YEAR_PATTERN.search(source_url) or OUTDATED_YEAR_PATTERN.search(content):
+                continue
+            
+            GLOBAL_SEEN_URLS.add(source_url)
+            results_str.append(f"【标题】: {name} \n【内容】: {content} \n【来源】: {source_url}\n")
+            
+        return "\n".join(results_str) if results_str else "暂无直接搜索结果。"
+    except Exception as e:
+        return f"搜索失败: {e}"
+
+# ==========================================
+# 3. 提示词与简报生成 (原封不动保留)
+# ==========================================
+def generate_briefing(client, model_name, comp_raw, weihai_raw, ind_data_dict, finance_raw, macro_raw, tech_raw):
+    ind_context = ""
+    for ind, content in ind_data_dict.items():
+        ind_context += f"--- 行业: {ind} ---\n{content}\n"
+
+    prompt = f"""
+    【全局核心设定】
     1. 角色：顶尖投行研究所首席经济师。无修辞，无客套，极端客观。今天是{TODAY_STR}。
-    2. 辖区绝对定义：下文中所有提到"大威海地区"、"威海市辖区"、"威海本地"的概念，均【严格且仅包含】威海、荣成、文登、乳山四个区域。
+    2. 辖区绝对定义：下文中所有提到“大威海地区”、“威海市辖区”、“威海本地”的概念，均【严格且仅包含】威海、荣成、文登、乳山四个区域。
     3. 严格审查每条素材的时间与真实性:
        - 如果内容事件发生时间涉及{TODAY_STR}之前一周以上的旧闻，绝对不予采纳！
        - 严禁拿旧闻（{CURRENT_YEAR - 1}年及以前的内容）凑数，或伪造虚假URL。
-    4. 【反摆烂绝对红线】：严禁在正文中输出任何诸如"受限于素材密度"、"未搜索到相关信息"等借口或声明性文字。必须竭尽全力从下方庞大的素材池中挖掘信息，严格满足各板块要求的数量！
+    4. 【反摆烂绝对红线】：严禁在正文中输出任何诸如“受限于素材密度”、“未搜索到相关信息”等借口或声明性文字。必须竭尽全力从下方庞大的素材池中挖掘信息，严格满足各板块要求的数量！
     5. 一个来源链接（URL）最多只能对应生成一条新闻，严格禁止一个素材反复使用。
-    6. 【新增：价值挖掘核心规则】：
-       - 核心必保：所有板块优先筛选"领导重点关注"的高价值信息（如目标企业重大订单、威海核心外贸政策、关键金融指标变动），确保"想看的能看到"；
-       - 惊喜挖掘：主动从素材池边缘/冷门素材中，识别"非预期但有长期价值"的信息（如威海中小企业冷门市场突破、新兴赛道试点、隐藏政策红利），确保"意想不到的也能看到"；
-       - 分析要求：每条新闻的"三句话梗概"中，第三句话必须为【价值分析句】——核心信息分析"直接商业影响"，惊喜信息分析"隐藏价值/长远意义"，不得仅陈述事实。
     
     【极度严厉的排版与格式指令】
     1. 必须首先生成【目录】，严格照抄以下 HTML 格式：
@@ -98,7 +144,7 @@ def generate_briefing():
          <div style="font-size: 10px; color: #999; margin-top: 4px;">来源：<a href="[URL]" style="color: #3498db; text-decoration: none;">[URL]</a></div>
        </div>
 
-    【六大板块内容架构（基于下方素材池）】
+      【六大板块内容架构（基于下方素材池）】
     一、 重点企业动态（强制生成 15 条）：
         【收录标准】：必须且只能是具体的实体企业。企业必须有明确的涉外属性（国际业务、海外投资、出口订单、外贸潜力）或重大的实体产能扩建。优先包含给定目标企业（{TARGET_COMPANIES}）的动态。
         【核心必保筛选】：
@@ -184,80 +230,117 @@ def generate_briefing():
     ## 六、 科技前沿与大语言模型
     （正文 HTML 代码）
     ---
-    <p style="text-align: center;"><strong>以上为本周新闻，均为自动收集并由AI生成</strong></p>
-    <p style="text-align: center;">🤖我们下周再见🤖</p>
-        """
-        # 格式化prompt并强制UTF-8
-        prompt = prompt_template.format(
-            TODAY_STR=TODAY_STR,
-            CURRENT_YEAR=CURRENT_YEAR,
-            TARGET_COMPANIES=TARGET_COMPANIES,
-            comp_raw=comp_raw,
-            weihai_raw=weihai_raw,
-            ind_context=ind_context,
-            finance_raw=finance_raw,
-            macro_raw=macro_raw,
-            tech_raw=tech_raw
-        ).encode('utf-8').decode('utf-8')
+    <p style="text-align: center;"><strong>以上为本周新闻，均为自动收集并由AI生成</strong></p >
+    <p style="text-align: center;">🤖我们下周再见🤖</p >
+    """
+    
+    time.sleep(GEMINI_REQUEST_DELAY)
 
-        time.sleep(GEMINI_REQUEST_DELAY)
-        
-        # 调用API（强制UTF-8请求体）
+    try:
         response = client.chat.completions.create(
             model=model_name,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            # 强制返回UTF-8编码
-            extra_headers={"Content-Type": "application/json; charset=utf-8"}
+            temperature=0.1
         )
-        
-        # 处理响应（确保UTF-8）
-        result = response.choices[0].message.content.strip()
-        return result if result else "生成的周报内容为空，请检查素材或API配置"
-    
+        return response.choices[0].message.content
     except Exception as e:
-        error_msg = f"生成简报失败：{str(e)}"
-        print(error_msg)
-        # 确保错误信息也是UTF-8
-        return error_msg.encode('utf-8').decode('utf-8')
+        return f"生成简报失败: {e}"
 
-# ===================== 6. 邮件发送函数（保留空值防护） =====================
+# ==========================================
+# 4. 邮件发送
+# ==========================================
 def send_email(subject, markdown_content):
-    """发送邮件，增加空值检查和字符处理"""
-    if not markdown_content:
-        markdown_content = "【警告】周报内容为空，生成失败"
-    
-    try:
-        markdown_content = markdown_content.replace("```html", "").replace("```", "")
-    except Exception as e:
-        print(f"处理邮件内容失败：{e}")
-        markdown_content = f"【内容处理失败】{markdown_content}"
-    
-    # 示例：打印邮件内容（替换为你的SMTP发送逻辑）
-    try:
-        print(f"===== 准备发送邮件 =====")
-        print(f"标题：{subject}")
-        print(f"内容：{markdown_content[:500]}...")  # 打印前500字符
-        return True
-    except Exception as e:
-        print(f"发送邮件失败：{e}")
-        return False
+    if not EMAIL_SENDER or not EMAIL_PASSWORD: return
+    receivers_list = [EMAIL_SENDER] if not EMAIL_RECEIVERS else [r.strip() for r in EMAIL_RECEIVERS.replace('，', ',').split(',') if r.strip()]
 
-# ===================== 7. 主函数 =====================
+    markdown_content = markdown_content.replace("```html", "").replace("```", "")
+    html_content = markdown.markdown(markdown_content)
+    
+    full_html = f"""
+    <html>
+    <head><style>
+        body {{ font-family: 'Microsoft YaHei', sans-serif; line-height: 1.8; color: #333; font-size: 14px; }} 
+        h1 {{ color: #1a365d; font-size: 24px; border-bottom: 2px solid #1a365d; padding-bottom: 10px; }}
+        h2 {{ color: #2c3e50; font-size: 20px; border-bottom: 1px dashed #ccc; padding-bottom: 8px; margin-top: 30px; }}
+        a {{ text-decoration: none; word-break: break-all; }}
+    </style></head>
+    <body>{html_content}</body>
+    </html>
+    """
+
+    msg = MIMEMultipart()
+    msg['From'] = formataddr(("Weihai Business Briefing", EMAIL_SENDER)) 
+    msg['To'] = ", ".join(receivers_list)
+    msg['Subject'] = Header(subject, 'utf-8')
+    msg.attach(MIMEText(full_html, 'html', 'utf-8'))
+
+    try:
+        print("尝试使用 SSL (端口 465) 发送邮件...")
+        server = smtplib.SMTP_SSL(SMTP_SERVER, 465, timeout=30)
+        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+        server.sendmail(EMAIL_SENDER, receivers_list, msg.as_string())
+        server.quit()
+        print("✅ 简报发送成功 (465端口)")
+    except Exception as e1:
+        print(f"⚠️ 465 端口失败 ({e1})，尝试备用 STARTTLS (端口 587)...")
+        try:
+            time.sleep(3) 
+            server = smtplib.SMTP(SMTP_SERVER, 587, timeout=30)
+            server.starttls() 
+            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+            server.sendmail(EMAIL_SENDER, receivers_list, msg.as_string())
+            server.quit()
+            print("✅ 简报发送成功 (587端口)")
+        except Exception as e2:
+            print(f"❌ 邮件发送最终失败: {e2}")
+
+# ==========================================
+# 5. 执行主流程
+# ==========================================
 if __name__ == "__main__":
-    print(f"-> 启动报告生成器，当前日期：{TODAY_STR} ...")
-    print(f"-> 系统编码：{sys.getdefaultencoding()} | Locale：{locale.getlocale()}")
-    print(f"-> 正在使用 {model_name} 接口...")
+    print(f"-> 启动报告生成器，当前日期: {TODAY_STR} ...")
+
+    print(f"-> 正在使用 Gemini 接口，模型: {GEMINI_MODEL}")
+    client = OpenAI(
+        api_key=GEMINI_API_KEY, 
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        timeout=600.0
+    )
+    model = GEMINI_MODEL
+
+    print(f"-> 搜集重点与优质产能企业...")
+    target_or_str = TARGET_COMPANIES.replace(' ', ' OR ')
+    # 加入 -股价 -涨停 -跌停 排除股市快讯
+    comp_raw_target = search_info(f"({target_or_str}) (签约 OR 中标 OR 财报 OR 出海 OR 布局 OR 产能) -股价 -涨停 -跌停 -股市", max_results=45)
+    # 强制聚焦外贸出海，并强力排除旅游、餐饮、客运、银行和政务会议
+    comp_raw_weihai = search_info("(威海 OR 荣成 OR 文登 OR 乳山) 企业 (外贸 OR 出海 OR 跨境电商 OR 国际业务 OR 海外订单) -旅游 -文娱 -餐饮 -客运 -银行 -股价 -动员大会 -招聘", max_results=45)
+    comp_raw = f"【指定目标企业】\n{comp_raw_target}\n\n【威海其他出海企业】\n{comp_raw_weihai}"
     
-    # 生成周报
-    briefing = generate_briefing()
-    print(f"-> 周报生成完成，长度：{len(briefing)} 字符")
+    print("-> 搜集大威海政经...")
+    # 增加新质生产力、政府债务、工作部署等词汇，移除强制排除的消费/招聘以便获取少量素材
+    weihai_raw = search_info("(威海 OR 荣成 OR 文登 OR 乳山) (宏观经济 OR 招商引资 OR 产业政策 OR 外经贸 OR 新质生产力 OR 政府债务 OR 工作部署 OR 消费数据 OR 招聘会) -奇闻 -事故", max_results=25)
     
-    # 发送邮件
-    email_subject = f"【威海商业情报】{TODAY_STR}"
-    send_result = send_email(email_subject, briefing)
+    industry_data = {}
+    for ind in INDUSTRY_LIST:
+        industry_data[ind] = search_info(f"{ind}行业 (市场规模 OR 最新政策 OR 发展趋势 OR 全球宏观 OR 最新动态)", max_results=25)
+        
+    print("-> 搜集金融与银行业务...")
+    finance_macro_raw = search_info("(LPR OR 存款准备金率 OR 美联储利率 OR 汇率变动 OR 跨境人民币)", max_results=20)
+    bank_raw = search_info("(威海 OR 荣成 OR 文登 OR 乳山) 银行 (跨境结算 OR 国际业务 OR 外汇便利化 OR 对公业务 OR 银企对接 OR 出口信贷) -零售金融 -个人理财", max_results=20)
+    finance_raw = f"【金融宏观数据】\n{finance_macro_raw}\n\n【威海辖区银行业务】\n{bank_raw}"
     
-    if send_result:
-        print("-> 邮件发送成功！")
-    else:
-        print("-> 邮件发送失败！")
+    print("-> 搜集宏观局势...")
+    macro_raw = search_info("(中国宏观经济 OR 全球局势 OR 国际贸易 OR 出海政策 OR 突发事件 ) 最新新闻", max_results=25)
+    
+    TECH_MEDIA_DOMAINS = [
+        "qbitai.com", "jiqizhixin.com", "36kr.com", "leiphone.com", "geekpark.net",
+        "techcrunch.com", "venturebeat.com", "theverge.com"
+    ]
+    
+    print("-> 搜集科技前沿 (AI/大模型/机器人/新能源)...")
+    tech_raw = search_info("(人工智能 OR 大语言模型 OR 机器人 OR 新能源) (前沿动向 OR 最新突破)", max_results=25, include_domains=TECH_MEDIA_DOMAINS)
+    
+    print("-> 智能新闻官正在撰写超级周报...")
+    briefing = generate_briefing(client, model, comp_raw, weihai_raw, industry_data, finance_raw, macro_raw, tech_raw)
+    
+    send_email(f"【威海商业情报】{TODAY_STR}", briefing)
